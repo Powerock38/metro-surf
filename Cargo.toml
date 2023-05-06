@@ -16,6 +16,5 @@ opt-level = 3
 [dependencies]
 bevy = "0.10.0"
 bevy_rapier3d = { version = "0.21.0", features = ["debug-render"] }
-bevy-inspector-egui = "0.18.0"
 bevy-tnua = { version = "0.2.2", features = ["rapier_3d"] }
 noisy_bevy = "0.3.0"
