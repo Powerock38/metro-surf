@@ -1,8 +1,8 @@
 mod player;
 mod terrain;
 
-use crate::player::{check_wall_crashes, player_movement, setup_player};
-use crate::terrain::setup_terrain;
+use crate::player::*;
+use crate::terrain::*;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 use bevy_tnua::{TnuaPlatformerPlugin, TnuaRapier3dPlugin};
@@ -14,7 +14,7 @@ pub const LANES_WIDTH: f32 = 10.0;
 pub const OBSTACLE_LENGTH: f32 = 50.0;
 pub const OBSTACLE_HEIGHT: f32 = 3.0;
 pub const MAX_OBSTACLE_STACK: i32 = 10;
-pub const DEFAULT_POSITION: Vec3 = Vec3::ZERO;
+pub const DEFAULT_POSITION: Vec3 = Vec3::Y;
 
 fn main() {
     App::new()
@@ -27,5 +27,7 @@ fn main() {
         .add_startup_system(setup_player)
         .add_system(player_movement)
         .add_system(check_wall_crashes)
+        .add_system(animation_patcher_system)
+        .add_system(player_animate)
         .run();
 }
