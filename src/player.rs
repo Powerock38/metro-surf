@@ -1,10 +1,8 @@
-use crate::{DEFAULT_POSITION, LANES_WIDTH};
+use crate::{DEFAULT_POSITION, LANES_WIDTH, MOVE_COOLDOWN};
 use bevy::gltf::Gltf;
 use bevy::prelude::*;
 use bevy::utils::HashMap;
 use bevy_rapier3d::prelude::*;
-use bevy_tnua::TnuaAnimatingState;
-use bevy_tnua::TnuaAnimatingStateDirective;
 use bevy_tnua::TnuaPlatformerAnimatingOutput;
 use bevy_tnua::{
     TnuaFreeFallBehavior, TnuaPlatformerBundle, TnuaPlatformerConfig, TnuaPlatformerControls,
@@ -25,11 +23,20 @@ pub struct GltfSceneHandler {
 pub struct AnimationsHandler {
     pub entity: Entity,
     pub animations: HashMap<String, Handle<AnimationClip>>,
+    pub player_state: PlayerStateForAnimation,
 }
 
+pub struct PlayerStateForAnimation {
+    pub state: AnimationState,
+    pub running_velocity: Vec3,
+    pub jumping_velocity: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum AnimationState {
     Running,
     Jumping,
+    Falling,
 }
 
 pub fn setup_player(mut commands: Commands, asset_server: Res<AssetServer>) {
@@ -45,7 +52,7 @@ pub fn setup_player(mut commands: Commands, asset_server: Res<AssetServer>) {
         })
         .insert(Player {
             target_lane: None,
-            move_cooldown: Timer::from_seconds(0.2, TimerMode::Once),
+            move_cooldown: Timer::from_seconds(MOVE_COOLDOWN, TimerMode::Once),
         })
         .insert(GltfSceneHandler {
             names_from: asset_server.load(glb_filename),
@@ -60,8 +67,8 @@ pub fn setup_player(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 });
         })
-        .insert(TnuaPlatformerBundle::new_with_config(
-            TnuaPlatformerConfig {
+        .insert(TnuaPlatformerBundle {
+            config: TnuaPlatformerConfig {
                 up: Vec3::Y,
                 forward: -Vec3::Z,
                 full_speed: 50.0,
@@ -80,17 +87,24 @@ pub fn setup_player(mut commands: Commands, asset_server: Res<AssetServer>) {
                 tilt_offset_angvel: 0.0,
                 tilt_offset_angacl: 0.0,
                 turning_angvel: 10.0,
+                jump_input_buffer_time: MOVE_COOLDOWN,
+                held_jump_cooldown: None,
+                jump_peak_prevention_at_upward_velocity: 0.0,
+                jump_peak_prevention_extra_gravity: 0.0,
+                height_change_impulse_for_duration: 0.0,
+                height_change_impulse_limit: 0.0,
             },
-        ))
+            ..default()
+        })
         .insert(Velocity::default())
         .insert(LockedAxes::ROTATION_LOCKED)
         // .insert(TnuaRapier3dSensorShape(Collider::capsule_y(0.2, 0.1)))
-        .insert(TnuaAnimatingState::<AnimationState>::default())
+        // .insert(TnuaAnimatingState::<AnimationState>::default())
         .insert(TnuaPlatformerAnimatingOutput::default())
         .with_children(|c| {
             c.spawn(Camera3dBundle {
-                // transform: Transform::from_xyz(0.0, 3.0, 6.0).looking_at(Vec3::Y, Vec3::Y),
-                transform: Transform::from_xyz(6.0, 0.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
+                transform: Transform::from_xyz(0.0, 3.0, 6.0).looking_at(Vec3::Y, Vec3::Y),
+                // transform: Transform::from_xyz(6.0, 0.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
                 ..default()
             });
         });
@@ -109,8 +123,10 @@ pub fn player_movement(
 
     let mut jumped = false;
 
+    let mut crouched = false;
+
     if player.move_cooldown.tick(time.delta()).finished() {
-        if keyboard.pressed(KeyCode::Down) {
+        if keyboard.any_pressed([KeyCode::Down, KeyCode::S]) {
             direction += Vec3::Z * 0.3;
         }
 
@@ -138,7 +154,10 @@ pub fn player_movement(
         }
 
         jumped = keyboard.pressed(KeyCode::Space);
-        moved = moved || jumped;
+
+        crouched = keyboard.pressed(KeyCode::LShift);
+
+        moved = moved || jumped || crouched;
     }
 
     if let Some(target_lane) = player.target_lane {
@@ -156,6 +175,7 @@ pub fn player_movement(
         desired_velocity: direction,
         desired_forward: -Vec3::Z,
         jump: jumped.then(|| 1.0),
+        float_height_offset: if crouched { -10.0 } else { 0.0 },
     };
 
     if moved {
@@ -200,6 +220,11 @@ pub fn animation_patcher_system(
                 cmd.insert(AnimationsHandler {
                     entity: player_entity,
                     animations: gltf.named_animations.clone(),
+                    player_state: PlayerStateForAnimation {
+                        state: AnimationState::Running,
+                        running_velocity: Vec3::ZERO,
+                        jumping_velocity: None,
+                    },
                 });
                 break;
             }
@@ -213,42 +238,48 @@ pub fn animation_patcher_system(
 }
 
 pub fn player_animate(
-    mut animations_handlers_query: Query<(
-        &mut TnuaAnimatingState<AnimationState>,
-        &TnuaPlatformerAnimatingOutput,
-        &AnimationsHandler,
-    )>,
+    mut animations_handlers_query: Query<(&TnuaPlatformerAnimatingOutput, &mut AnimationsHandler)>,
     mut animation_players_query: Query<&mut AnimationPlayer>,
 ) {
-    for (mut animating_state, animating_output, handler) in animations_handlers_query.iter_mut() {
+    for (animating_output, mut handler) in animations_handlers_query.iter_mut() {
         let Ok(mut player) = animation_players_query.get_mut(handler.entity) else { continue };
 
-        match animating_state.update_by_discriminant({
-            if animating_output.jumping_velocity.is_some() {
+        let new_state = if let Some(upward_velocity) = animating_output.jumping_velocity {
+            if upward_velocity > 0.0 {
                 AnimationState::Jumping
             } else {
-                AnimationState::Running
+                AnimationState::Falling
             }
-        }) {
-            TnuaAnimatingStateDirective::Maintain { state: _ } => {},
-            TnuaAnimatingStateDirective::Alter { old_state, state } => match (old_state, state) {
-                // (Some(AnimationState::Jumping), AnimationState::Running) => {
-                //     player
-                //         .start(handler.animations["ROLL"].clone_weak())
-                //         .set_speed(2.0);
-                // }
-                (_, AnimationState::Running) => {
-                    player
-                        .start(handler.animations["RUN"].clone_weak())
-                        .set_speed(2.0)
-                        .repeat();
-                }
-                (_, AnimationState::Jumping) => {
-                    player
-                        .start(handler.animations["FLIP"].clone_weak())
-                        .set_speed(2.5);
-                }
-            },
+        } else {
+            AnimationState::Running
+        };
+
+        match (handler.player_state.state, new_state) {
+            (AnimationState::Falling, AnimationState::Running) => {
+                player
+                    .play(handler.animations["ROLL"].clone_weak())
+                    .set_speed(2.5);
+            }
+            (_, AnimationState::Running) => {
+                player
+                    .play_with_transition(
+                        handler.animations["RUN"].clone_weak(),
+                        std::time::Duration::from_secs_f32(2.0),
+                    )
+                    .set_speed(2.0)
+                    .repeat();
+            }
+            (_, AnimationState::Jumping | AnimationState::Falling) => {
+                player
+                    .play(handler.animations["FLIP"].clone_weak())
+                    .set_speed(2.5);
+            }
         }
+
+        handler.player_state = PlayerStateForAnimation {
+            state: new_state,
+            running_velocity: animating_output.running_velocity,
+            jumping_velocity: animating_output.jumping_velocity,
+        };
     }
 }
